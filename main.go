@@ -506,6 +506,9 @@ func (h *relayHandler) handleServerControl(sess *session, c *conn, serverId stri
 func (h *relayHandler) handleServerData(sess *session, c *conn, serverId, connectionId string) {
 	slog.Info("server-data connected", "serverId", serverId, "connectionId", connectionId)
 
+	// Forwarding counters logged on disconnect (helps diagnose handshake issues).
+	var framesIn, bytesIn, errIn int
+
 	p := sess.getOrCreatePipe(connectionId)
 
 	// Atomically set serverData, swap out pending buffer with a fresh empty one,
@@ -555,7 +558,8 @@ func (h *relayHandler) handleServerData(sess *session, c *conn, serverId, connec
 		for _, cl := range clients {
 			cl.close(1012, "Server disconnected")
 		}
-		slog.Info("server-data disconnected", "serverId", serverId, "connectionId", connectionId)
+		slog.Info("server-data disconnected", "serverId", serverId, "connectionId", connectionId,
+			"framesIn", framesIn, "bytesIn", bytesIn, "errIn", errIn)
 		sess.removePipeIfEmpty(connectionId, p)
 		h.reg.remove(serverId, sess)
 	}()
@@ -565,12 +569,15 @@ func (h *relayHandler) handleServerData(sess *session, c *conn, serverId, connec
 		if err != nil {
 			break
 		}
+		framesIn++
+		bytesIn += len(msg)
 		// Hot path: only pipe.mu.RLock() — no session-level lock.
 		p.mu.RLock()
 		targets := append([]*conn(nil), p.clients...)
 		p.mu.RUnlock()
 		for _, cl := range targets {
 			if err := cl.send(msgType, msg); err != nil {
+				errIn++
 				slog.Error("forward server->client failed", "connectionId", connectionId, "err", err)
 			}
 		}
@@ -580,6 +587,9 @@ func (h *relayHandler) handleServerData(sess *session, c *conn, serverId, connec
 // handleClient manages an app/client socket (multiple allowed per connectionId).
 func (h *relayHandler) handleClient(sess *session, c *conn, serverId, connectionId string) {
 	slog.Info("client connected", "serverId", serverId, "connectionId", connectionId)
+
+	// Forwarding counters logged on disconnect (helps diagnose handshake issues).
+	var framesIn, bytesIn, framesBuffered, framesDirect, errOut int
 
 	p := sess.getOrCreatePipe(connectionId)
 
@@ -618,7 +628,9 @@ func (h *relayHandler) handleClient(sess *session, c *conn, serverId, connection
 			sess.notifyControl(map[string]any{"type": "disconnected", "connectionId": connectionId})
 			sess.removePipeIfEmpty(connectionId, p)
 		}
-		slog.Info("client disconnected", "serverId", serverId, "connectionId", connectionId)
+		slog.Info("client disconnected", "serverId", serverId, "connectionId", connectionId,
+			"framesIn", framesIn, "bytesIn", bytesIn,
+			"framesBuffered", framesBuffered, "framesDirect", framesDirect, "errOut", errOut)
 		h.reg.remove(serverId, sess)
 	}()
 
@@ -627,13 +639,17 @@ func (h *relayHandler) handleClient(sess *session, c *conn, serverId, connection
 		if err != nil {
 			break
 		}
+		framesIn++
+		bytesIn += len(msg)
 		// Fast path: serverData already set, send directly without holding any
 		// pipe-level lock during the send.
 		p.mu.RLock()
 		srv := p.serverData
 		p.mu.RUnlock()
 		if srv != nil {
+			framesDirect++
 			if err := srv.send(msgType, msg); err != nil {
+				errOut++
 				slog.Error("forward client->server failed", "connectionId", connectionId, "err", err)
 			}
 			continue
@@ -647,12 +663,15 @@ func (h *relayHandler) handleClient(sess *session, c *conn, serverId, connection
 		srv = p.serverData
 		if srv != nil {
 			p.mu.Unlock()
+			framesDirect++
 			if err := srv.send(msgType, msg); err != nil {
+				errOut++
 				slog.Error("forward client->server failed", "connectionId", connectionId, "err", err)
 			}
 			continue
 		}
 		p.pending.push(msgType, msg)
+		framesBuffered++
 		p.mu.Unlock()
 	}
 }
