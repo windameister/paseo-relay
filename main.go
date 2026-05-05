@@ -572,7 +572,7 @@ func (h *relayHandler) handleServerData(sess *session, c *conn, serverId, connec
 		framesIn++
 		bytesIn += len(msg)
 		// Debug: log first frames from daemon to see e2ee_ready and welcome.
-		if framesIn <= 2 {
+		if framesIn <= 6 {
 			preview := msg
 			if len(preview) > 120 {
 				preview = preview[:120]
@@ -653,7 +653,7 @@ func (h *relayHandler) handleClient(sess *session, c *conn, serverId, connection
 		framesIn++
 		bytesIn += len(msg)
 		// Debug: log first frame from each client to see what they send.
-		if framesIn <= 2 {
+		if framesIn <= 6 {
 			preview := msg
 			if len(preview) > 120 {
 				preview = preview[:120]
