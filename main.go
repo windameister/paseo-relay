@@ -508,23 +508,39 @@ func (h *relayHandler) handleServerData(sess *session, c *conn, serverId, connec
 
 	p := sess.getOrCreatePipe(connectionId)
 
+	// Atomically set serverData, swap out pending buffer with a fresh empty one,
+	// and drain the captured frames — all under the write lock. Holding the lock
+	// during the drain is required: it prevents handleClient from observing
+	// (serverData != nil) and sending a new frame directly to c before the
+	// pre-buffered frames have been delivered.
+	//
+	// Without this, the following sequence could lose messages:
+	//   1. handleClient reads serverData under RLock, sees nil, releases RLock.
+	//   2. handleServerData sets serverData = c, flushes p.pending (empty).
+	//   3. handleClient pushes the frame to p.pending — never flushed again.
+	// Symptom seen by users: form submissions arriving with blank fields, and
+	// the e2ee_hello handshake sometimes never reaching the daemon (mobile
+	// times out 1–2 seconds after connecting).
 	p.mu.Lock()
 	old := p.serverData
 	p.serverData = c
-	p.mu.Unlock()
-	if old != nil {
-		old.close(1008, "Replaced by new connection")
-	}
-
-	// Flush frames that arrived before the daemon connected.
-	p.mu.Lock()
-	buf := p.pending
-	p.mu.Unlock()
-	for _, frame := range buf.flush() {
+	oldBuf := p.pending
+	p.pending = newFrameBuffer(sess.maxBufferFrames)
+	flushed := oldBuf.flush()
+	for _, frame := range flushed {
 		if len(frame) == 0 {
 			continue
 		}
 		_ = c.send(int(frame[0]), frame[1:])
+	}
+	p.mu.Unlock()
+
+	if n := len(flushed); n > 0 {
+		slog.Info("server-data flushed pending frames",
+			"serverId", serverId, "connectionId", connectionId, "count", n)
+	}
+	if old != nil {
+		old.close(1008, "Replaced by new connection")
 	}
 
 	defer func() {
@@ -611,18 +627,33 @@ func (h *relayHandler) handleClient(sess *session, c *conn, serverId, connection
 		if err != nil {
 			break
 		}
-		// Hot path: only pipe.mu.RLock() — no session-level lock.
+		// Fast path: serverData already set, send directly without holding any
+		// pipe-level lock during the send.
 		p.mu.RLock()
 		srv := p.serverData
 		p.mu.RUnlock()
-
-		if srv == nil {
-			p.pending.push(msgType, msg)
+		if srv != nil {
+			if err := srv.send(msgType, msg); err != nil {
+				slog.Error("forward client->server failed", "connectionId", connectionId, "err", err)
+			}
 			continue
 		}
-		if err := srv.send(msgType, msg); err != nil {
-			slog.Error("forward client->server failed", "connectionId", connectionId, "err", err)
+
+		// Slow path: serverData is nil. Re-check under write lock to avoid the
+		// race where handleServerData sets serverData and drains p.pending
+		// between our RUnlock and the push below — which would leave the
+		// frame stranded in pending forever.
+		p.mu.Lock()
+		srv = p.serverData
+		if srv != nil {
+			p.mu.Unlock()
+			if err := srv.send(msgType, msg); err != nil {
+				slog.Error("forward client->server failed", "connectionId", connectionId, "err", err)
+			}
+			continue
 		}
+		p.pending.push(msgType, msg)
+		p.mu.Unlock()
 	}
 }
 
