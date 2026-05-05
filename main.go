@@ -571,6 +571,17 @@ func (h *relayHandler) handleServerData(sess *session, c *conn, serverId, connec
 		}
 		framesIn++
 		bytesIn += len(msg)
+		// Debug: log first frames from daemon to see e2ee_ready and welcome.
+		if framesIn <= 2 {
+			preview := msg
+			if len(preview) > 120 {
+				preview = preview[:120]
+			}
+			slog.Info("server->client frame",
+				"connectionId", connectionId, "n", framesIn,
+				"msgType", msgType, "size", len(msg),
+				"preview", string(preview))
+		}
 		// Hot path: only pipe.mu.RLock() — no session-level lock.
 		p.mu.RLock()
 		targets := append([]*conn(nil), p.clients...)
@@ -641,6 +652,17 @@ func (h *relayHandler) handleClient(sess *session, c *conn, serverId, connection
 		}
 		framesIn++
 		bytesIn += len(msg)
+		// Debug: log first frame from each client to see what they send.
+		if framesIn <= 2 {
+			preview := msg
+			if len(preview) > 120 {
+				preview = preview[:120]
+			}
+			slog.Info("client->server frame",
+				"connectionId", connectionId, "n", framesIn,
+				"msgType", msgType, "size", len(msg),
+				"preview", string(preview))
+		}
 		// Fast path: serverData already set, send directly without holding any
 		// pipe-level lock during the send.
 		p.mu.RLock()
